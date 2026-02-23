@@ -1,12 +1,13 @@
 import os
 import asyncio
 from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
-from llama_index.core.workflow import StartEvent, StopEvent, Workflow, step
+from llama_index.core.workflow import StartEvent, StopEvent, Workflow, step, Event, Context
 from llama_index.core.agent.workflow import (
     AgentWorkflow,
     FunctionAgent,
     ReActAgent
 )
+from pydantic import BaseModel, Field
 
 ## retrieve token and initialize llm
 hf_token = os.environ.get("HF_TOKEN")
@@ -39,26 +40,52 @@ moderator_agent = ReActAgent(tools=[],
                                            "the first arguments. When the agent provides a final answer, it then becomes"
                                            "the turn of the next agent")
 
+class DebateContext(BaseModel):
+    """
+    Debate context model
+    """
+    debate_motion: str = "AI will replace developers"
+    arguments: list[str] = Field(default_factory=list)
+    turn: int = 0
+    max_turns: int = 6
+
 
 ## processing workflows are emitted from the moderating agent
-class ProcessingEvent(Workflow):
-    def __init__(self, debate_context):
+class ProcessingEvent(Event):
+    def __init__(self, debate_context: Context[DebateContext]):
         super().__init__()
         self.debate_context = debate_context  # contains the chat history and the most recent argument
 
 
 ## define the workflow between agents
 class DebateWorkflow(Workflow):
+    ## initialize the workflow with the agents
+    def __init__(self, for_agent: ReActAgent, against_agent: ReActAgent):
+        super().__init__()
+        self.for_agent = for_agent
+        self.against_agent = against_agent
+
     @step
-    async def receive_motion(self, event: StartEvent) -> ProcessingEvent:
+    async def start(self, ctx: Context[DebateContext], event: StartEvent) -> ProcessingEvent:
         """
         This receives the debate motion and assigns it to the contestant agents
+        :param ctx: the debate context to be used in the workflow
         :param event: StartEvent -> Triggers the start of the workflow
         :return: ProcessingEvent assigning the turn to the next contestant agent
         """
-        debate_context = {}
-        debate_context.setdefault("motion", "Talk about something interesting")
-        return ProcessingEvent(debate_context)
+
+        # # initialize the context within the method that contains the start event
+        # debate_context = {
+        #     "motion": event.input,
+        #     "arguments": [],
+        #     "turn": 0,
+        #     "max_turns": 6
+        # }
+
+        async with ctx.store.edit_state() as ctx_state:
+            pass
+
+        return ProcessingEvent(ctx)
 
     @step
     async def provide_argument(self, event: ProcessingEvent) -> ProcessingEvent | StopEvent:
@@ -71,27 +98,48 @@ class DebateWorkflow(Workflow):
          or a StopEvent declaring the end of the debate
         """
 
-        debate_motion = event.debate_context["motion"]
-        most_recent_argument = event.debate_context["argument"][-1]
+        ctx = event.debate_context
+        agent = for_agent if await ctx.store.get("turn") % 2 == 0 else against_agent
 
-        ## append the most recent argument provided by the current agent
-        ## The response indicated below should be the response from either of the agents
-        ## whose turn it is to provide an argument
-        response = None
-        debate_motion["argument"].append(response)
+        prompt = f"""
+        Motion: {await ctx.store.get("debate_motion")}
+        
+        Previous arguments:
+        {"\n".join(await ctx.store.get("arguments"))}
+        """
 
-        pass
+        response = await agent.run(prompt)
+
+        arguments = await ctx.store.get("arguments")
+        arguments.append(str(response))
+        await ctx.store.set("arguments", arguments)
+        await ctx.store.set("turn", await ctx.store.get("turn") + 1)
+
+        if await ctx.store.get("turn") >= await ctx.store.get("max_turns"):
+            return StopEvent(result=ctx)
+
+        return ProcessingEvent(ctx)
 
 
 # chat loop
-print("Contestant 1 ready! \n")
+print("Contestants ready! \n")
 
-user_input = input("Motion: ").strip()
+async def main():
+    motion = input("Motion: ").strip()
 
-async def run():
-    response = await moderator_agent.run(user_input, reset=False)
-    print("Bot: ", response)
+    workflow = DebateWorkflow(for_agent, against_agent)
+    ctx = Context(workflow)
 
+    # create the debate context state and store it in the context instance
+    ctx_state = DebateContext()
+    await ctx.store.set_state(ctx_state)
+
+    final_state = workflow.run(ctx=ctx)
+
+    print("\n====== Debate Finished ======\n")
+    print("Final state:", final_state)
+    for i, arg in enumerate(await final_state.ctx.store.get("arguments"), 1):
+        print(f"Argument {i}:\n{arg}\n")
 
 if __name__ == "__main__":
-    loop = asyncio.run(run())
+    asyncio.run(main())
