@@ -16,6 +16,8 @@ llm = HuggingFaceInferenceAPI(
     model="Qwen/Qwen2.5-Coder-32B-Instruct",
     token=hf_token)
 
+# TODO: Update the system prompt implementation
+
 ## define the participating agents
 for_agent = ReActAgent(tools=[],
                        model=llm,
@@ -82,8 +84,7 @@ class DebateWorkflow(Workflow):
         #     "max_turns": 6
         # }
 
-        async with ctx.store.edit_state() as ctx_state:
-            pass
+        await ctx.store.set("debate_motion", event.input)
 
         return ProcessingEvent(ctx)
 
@@ -127,6 +128,9 @@ print("Contestants ready! \n")
 async def main():
     motion = input("Motion: ").strip()
 
+    # response = await for_agent.run(motion)
+    # print("against agent:\n", response)
+
     workflow = DebateWorkflow(for_agent, against_agent)
     ctx = Context(workflow)
 
@@ -134,11 +138,11 @@ async def main():
     ctx_state = DebateContext()
     await ctx.store.set_state(ctx_state)
 
-    final_state = workflow.run(ctx=ctx)
+    final_state = await workflow.run(ctx=ctx, input=motion)
 
     print("\n====== Debate Finished ======\n")
     print("Final state:", final_state)
-    for i, arg in enumerate(await final_state.ctx.store.get("arguments"), 1):
+    for i, arg in enumerate(await final_state.store.get("arguments"), 1):
         print(f"Argument {i}:\n{arg}\n")
 
 if __name__ == "__main__":
