@@ -1,149 +1,129 @@
-import os
-import asyncio
-from llama_index.llms.huggingface_api import HuggingFaceInferenceAPI
-from llama_index.core.workflow import StartEvent, StopEvent, Workflow, step, Event, Context
-from llama_index.core.agent.workflow import (
-    AgentWorkflow,
-    FunctionAgent,
-    ReActAgent
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+# initialize the llm
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.7)
+
+##### ---------- PROMPTS ----------- #####
+
+
+## define the pro agent system prompt
+pro_prompt = ChatPromptTemplate.from_template(
+    """
+    You are an expert debater arguing for the following motion:
+    
+    "{topic}"
+    
+    Your job:
+    - Strongly support the motion
+    - Provide clear reasoning and examples
+    - Respond directly to your opponent's arguments
+    
+    Opponent's last argument:
+    {opponent_argument}
+    
+    Your response:
+    """
 )
-from pydantic import BaseModel, Field
 
-## retrieve token and initialize llm
-hf_token = os.environ.get("HF_TOKEN")
 
-llm = HuggingFaceInferenceAPI(
-    model="Qwen/Qwen2.5-Coder-32B-Instruct",
-    token=hf_token)
-
-# TODO: Update the system prompt implementation
-
-## define the participating agents
-for_agent = ReActAgent(tools=[],
-                       model=llm,
-                       add_base_tools=False,
-                       system_prompt="You are a debater whose task is to argue in favour of a given motion"
-                                     "Argue in a concise, professional tone."
-                                     "When you are done providing your arguments say 'Over to you moderator'")
-
-against_agent = ReActAgent(tools=[],
-                           model=llm,
-                           add_base_tools=False,
-                           system_prompt="You are a debater whose task is to argue against a given motion"
-                                         "Argue in an aggressive, dismissive tone"
-                                         "When you are done providing your arguments say 'Over to you moderator'")
-
-moderator_agent = ReActAgent(tools=[],
-                             model=llm,
-                             add_base_tools=False,
-                             managed_agents=[for_agent, against_agent],
-                             system_prompt="You are the moderator of a debate. You will receive the topic"
-                                           "of the debate and pick one of the agents assigned to you to provide"
-                                           "the first arguments. When the agent provides a final answer, it then becomes"
-                                           "the turn of the next agent")
-
-class DebateContext(BaseModel):
+# define the con agent system prompt
+con_prompt = ChatPromptTemplate.from_template(
     """
-    Debate context model
+    You are an expert debater arguing against the following motion:
+    
+    "{topic}"
+    
+    Your job:
+    - Critically attack the motion
+    - Point out weaknesses in the opponent's argument
+    - Provide counterexamples
+    - Use ad-hominem attacks against your opponent
+    
+    Opponent's last argument:
+    {opponent_argument}
+    
+    Your response:
     """
-    debate_motion: str = "AI will replace developers"
-    arguments: list[str] = Field(default_factory=list)
-    turn: int = 0
-    max_turns: int = 6
+)
 
 
-## processing workflows are emitted from the moderating agent
-class ProcessingEvent(Event):
-    def __init__(self, debate_context: Context[DebateContext]):
-        super().__init__()
-        self.debate_context = debate_context  # contains the chat history and the most recent argument
+# define the debate judge system prompt
+judge_prompt = ChatPromptTemplate.from_template(
+    """
+    You are a judge evaluating a debate.
+    
+    Topic:
+    {topic}
+    
+    Pro_arguments:
+    {pro_history}
+    
+    Con arguments:
+    {con_history}
+    
+    Decide:
+    1. Who won (Pro or Con)
+    2. Why (focus on logic, evidence, and rebuttals)
+    """
+)
 
+####### Agent functions ########
 
-## define the workflow between agents
-class DebateWorkflow(Workflow):
-    ## initialize the workflow with the agents
-    def __init__(self, for_agent: ReActAgent, against_agent: ReActAgent):
-        super().__init__()
-        self.for_agent = for_agent
-        self.against_agent = against_agent
+## configuring the agents by giving them the topic and arguments in order to formulate a response
 
-    @step
-    async def start(self, ctx: Context[DebateContext], event: StartEvent) -> ProcessingEvent:
-        """
-        This receives the debate motion and assigns it to the contestant agents
-        :param ctx: the debate context to be used in the workflow
-        :param event: StartEvent -> Triggers the start of the workflow
-        :return: ProcessingEvent assigning the turn to the next contestant agent
-        """
+def pro_agent(topic, opponent_argument):
+    chain = pro_prompt | llm
+    return chain.invoke({
+        "topic": topic,
+        "opponent_argument": opponent_argument
+    }).content
 
-        # # initialize the context within the method that contains the start event
-        # debate_context = {
-        #     "motion": event.input,
-        #     "arguments": [],
-        #     "turn": 0,
-        #     "max_turns": 6
-        # }
+def con_agent(topic, opponent_argument):
+    chain = con_prompt | llm
+    return chain.invoke({
+        "topic": topic,
+        "opponent_argument": opponent_argument
+    }).content
 
-        await ctx.store.set("debate_motion", event.input)
+def judge_agent(topic, pro_history, con_history):
+    chain = judge_prompt | llm
+    return chain.invoke({
+        "topic": topic,
+        "pro_history": pro_history,
+        "con_history": con_history
+    }).content
 
-        return ProcessingEvent(ctx)
+######## debate loop ########
 
-    @step
-    async def provide_argument(self, event: ProcessingEvent) -> ProcessingEvent | StopEvent:
-        """
-        This receives the debate motion and assigns it to the contestant agents
-        The method uses the debate_motion and the most recent argument and provides this to the next
-        contestant agent to formulate the next argument/response
-        :param event: ProcessingEvent from the start of the workflow
-        :return: ProcessingEvent assigning the turn to the next contestant agent
-         or a StopEvent declaring the end of the debate
-        """
+def run_debate(topic, rounds=3):
+    pro_history = []
+    con_history = []
 
-        ctx = event.debate_context
-        agent = for_agent if await ctx.store.get("turn") % 2 == 0 else against_agent
+    pro_last = "No argument yet."
+    con_last = "No argument yet."
 
-        prompt = f"""
-        Motion: {await ctx.store.get("debate_motion")}
-        
-        Previous arguments:
-        {"\n".join(await ctx.store.get("arguments"))}
-        """
+    for i in range(rounds):
+        print(f"\n--- Round {i+1} ---")
 
-        response = await agent.run(prompt)
+        pro_response = pro_agent(topic, con_last)
+        pro_history.append(pro_response)
+        print("\nPRO:\n", pro_response)
 
-        arguments = await ctx.store.get("arguments")
-        arguments.append(str(response))
-        await ctx.store.set("arguments", arguments)
-        await ctx.store.set("turn", await ctx.store.get("turn") + 1)
+        con_response = con_agent(topic, pro_last)
+        con_history.append(con_response)
+        print("\nCON:\n", con_response)
 
-        if await ctx.store.get("turn") >= await ctx.store.get("max_turns"):
-            return StopEvent(result=ctx)
+        pro_last = pro_response
+        con_last = con_response
 
-        return ProcessingEvent(ctx)
+    print("\n Judgement")
+    result = judge_agent(topic, "\n".join(pro_history), "\n".join(con_history))
+    print(result)
 
-
-# chat loop
-print("Contestants ready! \n")
-
-async def main():
-    motion = input("Motion: ").strip()
-
-    # response = await for_agent.run(motion)
-    # print("against agent:\n", response)
-
-    workflow = DebateWorkflow(for_agent, against_agent)
-    ctx = Context(workflow)
-
-    # create the debate context state and store it in the context instance
-    ctx_state = DebateContext()
-    await ctx.store.set_state(ctx_state)
-
-    final_state = await workflow.run(ctx=ctx, input=motion)
-
-    print("\n====== Debate Finished ======\n")
-    print("Final state:", final_state)
-    for i, arg in enumerate(await final_state.store.get("arguments"), 1):
-        print(f"Argument {i}:\n{arg}\n")
+###### RUN ######
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    topic = "AI will do more good than harm to society"
+    run_debate(topic, rounds=3)
+
